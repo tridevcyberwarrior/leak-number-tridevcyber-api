@@ -2,94 +2,22 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import duckdb
+import os
 
 app = FastAPI()
 
-con = duckdb.connect()
-con.execute("INSTALL httpfs;")
-con.execute("LOAD httpfs;")
+# Lazy connection for serverless
+_db_conn = None
 
-LANDING_PAGE_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hitek Data Gateway - LIVE</title>
-    <style>
-        body { margin: 0; overflow: hidden; background-color: #050505; color: #00ffcc; font-family: 'Courier New', Courier, monospace; }
-        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: -1; }
-        .overlay { 
-            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
-            text-align: center; background: rgba(10, 10, 10, 0.85); padding: 50px; 
-            border: 1px solid #00ffcc; border-radius: 12px; box-shadow: 0 0 30px rgba(0, 255, 204, 0.3); 
-            backdrop-filter: blur(5px);
-        }
-        h1 { margin: 0 0 15px 0; font-size: 3.5em; text-transform: uppercase; letter-spacing: 6px; text-shadow: 0 0 15px #00ffcc; }
-        p { font-size: 1.2em; margin: 8px 0; color: #ccc; }
-        .highlight { color: #00ffcc; font-weight: bold; }
-        .status-box { 
-            margin-top: 30px; font-weight: bold; padding: 15px; 
-            border-radius: 8px; background: rgba(0, 255, 204, 0.1); 
-            border: 1px solid rgba(0, 255, 204, 0.5);
-            font-size: 1.1em;
-        }
-        .blinking { animation: blinker 1.5s linear infinite; display: inline-block; }
-        @keyframes blinker { 50% { opacity: 0; } }
-    </style>
-</head>
-<body>
-    <div id="canvas-container"></div>
-    <div class="overlay">
-        <h1>SYSTEM ONLINE</h1>
-        <p>API Gateway is <span class="highlight">Active & Secured</span></p>
-        <p>Parquet Cloud Engine: <span class="highlight">Connected</span></p>
-        <div class="status-box">
-            <span class="blinking" style="color: #00ffcc;">●</span> HTTP 200 OK - LISTENING FOR QUERIES
-        </div>
-    </div>
+def get_db():
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = duckdb.connect()
+        _db_conn.execute("INSTALL httpfs;")
+        _db_conn.execute("LOAD httpfs;")
+    return _db_conn
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script>
-        const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
-        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-        
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        document.getElementById('canvas-container').appendChild(renderer.domElement);
-
-        const geometry = new THREE.BufferGeometry();
-        const vertices = [];
-        for (let i = 0; i < 8000; i++) {
-            vertices.push(THREE.MathUtils.randFloatSpread(3000));
-            vertices.push(THREE.MathUtils.randFloatSpread(3000));
-            vertices.push(THREE.MathUtils.randFloatSpread(3000));
-        }
-        
-        geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-        const material = new THREE.PointsMaterial({ color: 0x00ffcc, size: 2.5, transparent: true, opacity: 0.8 });
-        const points = new THREE.Points(geometry, material);
-        scene.add(points);
-
-        camera.position.z = 1200;
-
-        function animate() {
-            requestAnimationFrame(animate);
-            points.rotation.x += 0.0005;
-            points.rotation.y += 0.001;
-            renderer.render(scene, camera);
-        }
-        animate();
-
-        window.addEventListener('resize', () => {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
-        });
-    </script>
-</body>
-</html>
-"""
+# ... HTML same rakho ...
 
 @app.exception_handler(StarletteHTTPException)
 async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
@@ -98,7 +26,7 @@ async def custom_http_exception_handler(request: Request, exc: StarletteHTTPExce
             status_code=404,
             content={
                 "status": "rejected",
-                "message": "Invalid endpoint. STRICTLY use /FetchData?Number=XXXXXXXXXX",
+                "message": "Invalid endpoint. Use /api/FetchData?Number=XXXXXXXXXX",
                 "Developer": "@tridevcyber"
             }
         )
@@ -111,14 +39,15 @@ async def custom_http_exception_handler(request: Request, exc: StarletteHTTPExce
 def root_landing_page():
     return HTMLResponse(content=LANDING_PAGE_HTML, status_code=200)
 
-@app.get("/FetchData")
+@app.get("/api/FetchData")  # /api/ prefix add kiya
 def fetch_data(Number: str = Query(None)):
-    if not Number or not Number.isdigit() or len(Number) < 10 or len(Number) > 15:
+    # Validation
+    if not Number or not Number.isdigit() or len(Number) != 10:
         return JSONResponse(
             status_code=400,
             content={
                 "status": "rejected",
-                "message": "Invalid parameter. STRICTLY use /FetchData?Number=XXXXXXXXXX",
+                "message": "Invalid. Use /api/FetchData?Number=10digits",
                 "Developer": "@tridevcyber"
             }
         )
@@ -129,25 +58,22 @@ def fetch_data(Number: str = Query(None)):
     alt_url = f"https://huggingface.co/datasets/CutehackX/hitek-data-bucket/resolve/main/alt_master_shard_{last_digit}.parquet"
     
     try:
-        query = f"""
-            SELECT *, 'Main' AS _record_type FROM read_parquet('{primary_url}') WHERE mobile = '{Number}'
+        con = get_db()
+        
+        # Parameterized query - SQL Injection safe
+        query = """
+            SELECT * FROM read_parquet(?) WHERE mobile = ?
             UNION ALL
-            SELECT *, 'Alt' AS _record_type FROM read_parquet('{alt_url}') WHERE alt = '{Number}'
+            SELECT * FROM read_parquet(?) WHERE alt = ?
         """
         
-        raw_results = con.execute(query).df().to_dict(orient="records")
+        df = con.execute(query, [primary_url, Number, alt_url, Number]).df()
         
-        main_records = []
-        alt_records = []
+        # Split results
+        main_recs = df[df['mobile'] == Number].to_dict('records') if 'mobile' in df.columns else []
+        alt_recs = df[df['alt'] == Number].to_dict('records') if 'alt' in df.columns else []
         
-        for row in raw_results:
-            rec_type = row.pop('_record_type')
-            if rec_type == 'Main':
-                main_records.append(row)
-            else:
-                alt_records.append(row)
-        
-        if not main_records and not alt_records:
+        if not main_recs and not alt_recs:
             return JSONResponse(
                 status_code=404,
                 content={
@@ -159,19 +85,34 @@ def fetch_data(Number: str = Query(None)):
             
         return {
             "status": "success", 
-            "Data": {
-                "Main_Records": main_records,
-                "Alt_Records": alt_records
+            "phone": Number,
+            "main_count": len(main_recs),
+            "alt_count": len(alt_recs),
+            "data": {
+                "main": main_recs,
+                "alt": alt_recs
             },
             "Developer": "@tridevcyber"
         }
         
+    except duckdb.Error as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "db_error",
+                "message": str(e),
+                "Developer": "@tridevcyber"
+            }
+        )
     except Exception as e:
         return JSONResponse(
             status_code=500,
             content={
                 "status": "error",
-                "message": f"Database processing error: {str(e)}",
+                "message": "Internal server error",
                 "Developer": "@tridevcyber"
             }
         )
+
+# Vercel handler
+handler = app
